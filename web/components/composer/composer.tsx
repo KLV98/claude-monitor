@@ -9,16 +9,18 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from "react";
-import { ArrowUp, Mic, Paperclip, Square } from "lucide-react";
+import { ArrowUp, Paperclip, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type {
   Attachment,
+  BackgroundTask,
   ContextUsageBreakdown,
   Effort,
   SessionProvider,
   SessionUsage,
 } from "@/lib/chat-types";
+import { BackgroundDock } from "@/components/chat/background-dock";
 import { modelById } from "@/lib/models";
 import {
   matchSlashCommands,
@@ -35,6 +37,7 @@ import { ModePicker, type PermissionMode } from "./mode-picker";
 import { ModeBanner } from "./mode-banner";
 import { MultiPhaseToggle, hintForMultiPhase } from "./intent-picker";
 import { SlashCommandMenu } from "./slash-command-menu";
+import { ScriptRunner } from "./script-runner";
 
 export interface ComposerSubmit {
   text: string;
@@ -95,6 +98,12 @@ interface CommonProps {
   // Switching between chats remounts ChatPanel, so each session's
   // unfinished draft survives the navigation.
   draftKey?: string;
+  // User-typed message history for terminal-style ↑/↓ recall.
+  // Oldest first, newest last. Pass undefined to disable navigation
+  // (home composer has no prior turns to recall). Strip slash-command
+  // envelopes etc. before passing so the user re-sees what they typed,
+  // not the synthetic wrapper.
+  history?: string[];
 }
 
 interface HomeProps extends CommonProps {
@@ -113,6 +122,14 @@ interface HomeProps extends CommonProps {
 interface SessionProps extends CommonProps {
   mode: "session";
   cwd: string;
+  // BackgroundDock plumbing. Optional — when provided, the composer
+  // renders a compact "(N) shell" chip next to the Scripts button
+  // that opens a popover for inspecting / killing SDK background
+  // tasks (Bash run_in_background, etc.).
+  sessionId?: string;
+  bgTasks?: BackgroundTask[];
+  onStopBgTask?: (taskId: string) => Promise<void>;
+  onDismissBgTask?: (taskId: string) => void;
 }
 
 type Props = HomeProps | SessionProps;
@@ -152,6 +169,16 @@ export function Composer(props: Props) {
   // call without depending on React state, which wouldn't have
   // updated yet on the same keystroke.
   const submittingRef = useRef(false);
+  // History navigation cursor. null means "not recalling" — typing
+  // edits the user's live draft. Once ↑ is pressed we capture that
+  // draft into historyDraftRef and walk backward through
+  // props.history; ↓ walks forward and falling off the end restores
+  // the draft. Matches bash/zsh + the Claude CLI's REPL.
+  const [historyIdx, setHistoryIdx] = useState<number | null>(null);
+  const historyDraftRef = useRef<string>("");
+  // Mirrors ScriptRunner's running state so we can paint the chip
+  // row with a subtle activity sweep while a build/test is alive.
+  const [scriptRunning, setScriptRunning] = useState(false);
 
   // Load the persisted draft post-mount. Runs on first render (initial
   // draftKey) so the textarea picks up the stored value as soon as
@@ -221,17 +248,84 @@ export function Composer(props: Props) {
     if (!text.trimStart().startsWith("/")) setMenuDismissed(false);
   }, [text]);
 
+  // Sending while busy is allowed — the backend pushes onto inputQueue
+  // and the SDK consumes it when the in-flight turn finishes. The
+  // QueueIndicator surfaces the pending entries. Only `disabled`
+  // (session closed/errored) blocks submission.
   const canSend =
-    !props.busy &&
     !props.disabled &&
     (text.trim().length > 0 || attachments.length > 0);
+
+  // Move the caret to the end of whatever the textarea now holds.
+  // Used by history recall + draft restore so the next keystroke
+  // appends rather than landing somewhere in the middle. We read
+  // ta.value at execution time (post-React-commit) rather than
+  // capturing the target string at call time — rapid ↑↑ presses can
+  // schedule overlapping microtasks, and the last one to run should
+  // pin to whatever React eventually committed.
+  const caretToEnd = () => {
+    queueMicrotask(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      ta.focus();
+      const end = ta.value.length;
+      ta.setSelectionRange(end, end);
+    });
+  };
+
+  const recallHistory = (idx: number) => {
+    const list = props.history;
+    if (!list || list.length === 0) return;
+    const clamped = Math.max(0, Math.min(idx, list.length - 1));
+    if (historyIdx === null) historyDraftRef.current = text;
+    setHistoryIdx(clamped);
+    setText(list[clamped] ?? "");
+    caretToEnd();
+  };
+
+  const exitHistory = () => {
+    if (historyIdx === null) return;
+    setHistoryIdx(null);
+    setText(historyDraftRef.current);
+    caretToEnd();
+  };
+
+  // History recall fires only when the caret is at the absolute
+  // boundary of the textarea (position 0 for ↑, value.length for ↓).
+  // The earlier "wait a microtask, see if the browser moved the
+  // caret" approach raced the default-action timing — in practice
+  // microtasks sometimes flushed before the keydown's default ran,
+  // so a multi-line draft would lose its in-progress text to a
+  // history recall on a plain row-up press. With Enter=newline as
+  // the composer convention, multi-line drafts have explicit \n
+  // boundaries; checking the caret position is deterministic and
+  // matches bash/zsh + the Claude CLI REPL.
+  const tryHistoryAfterArrow = (direction: "up" | "down"): boolean => {
+    const ta = taRef.current;
+    const list = props.history;
+    if (!ta || !list || list.length === 0) return false;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    if (direction === "up") {
+      if (start !== 0 || end !== 0) return false;
+      const next = historyIdx === null ? list.length - 1 : historyIdx - 1;
+      recallHistory(next);
+      return true;
+    }
+    if (start !== ta.value.length || end !== ta.value.length) return false;
+    if (historyIdx === null) return false;
+    const next = historyIdx + 1;
+    if (next >= list.length) exitHistory();
+    else recallHistory(next);
+    return true;
+  };
 
   // submitText accepts an optional override so the slash-menu can submit
   // the canonical "/<name>" string for the highlighted command without
   // first round-tripping through React state (which wouldn't be visible
   // synchronously on the same keystroke).
   const submitText = async (override?: string) => {
-    if (props.busy || props.disabled) return;
+    if (props.disabled) return;
     if (submittingRef.current) return;
     const textToSend = (override ?? text).trim();
     if (textToSend.length === 0 && attachments.length === 0) return;
@@ -244,6 +338,8 @@ export function Composer(props: Props) {
     setText("");
     setAttachments([]);
     setMenuDismissed(false);
+    setHistoryIdx(null);
+    historyDraftRef.current = "";
     // Wipe the persisted draft now that we've committed the text.
     // The 300ms debounce on `text` would race with this otherwise —
     // forcing a write here keeps the storage in sync with what's
@@ -323,6 +419,37 @@ export function Composer(props: Props) {
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // IME composition guard. When the user is mid-composition with a
+    // Vietnamese (Telex/VNI), Japanese, Chinese, or Korean IME, the
+    // browser swallows the keystroke and the synthetic event carries
+    // `isComposing` (or the legacy keyCode 229). If we treat that
+    // Shift+Enter as "send" we capture React state *before* the IME
+    // commits its final glyph; submitText then clears the textarea and
+    // the IME's pending commit lands back into the now-empty input,
+    // leaving a trailing fragment like "điệu" behind. Letting the IME
+    // handle the key first means the composition finishes before any
+    // submit/menu logic runs.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    // Terminal-style history recall. Only fires when the caret is
+    // at the textarea's start (↑) or end (↓); anywhere else we leave
+    // the keystroke alone so the browser performs normal row
+    // navigation (including across visually wrapped lines).
+    if (
+      !menuOpen &&
+      (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+      props.history &&
+      props.history.length > 0
+    ) {
+      const fired = tryHistoryAfterArrow(
+        e.key === "ArrowUp" ? "up" : "down",
+      );
+      if (fired) {
+        e.preventDefault();
+        return;
+      }
+      // Fall through — caret wasn't at the boundary, let the
+      // browser move the cursor as usual.
+    }
     if (menuOpen) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -429,8 +556,15 @@ export function Composer(props: Props) {
           query={menuQuery}
         />
       )}
-      {/* Top chip row — folder + (model when home) */}
-      <div className="flex flex-wrap items-center gap-1.5 px-2 pt-2">
+      {/* Top chip row — folder/branch on the left, project scripts on
+          the right. Single-line layout: a wrap on this row leaves a
+          ragged second line that the user explicitly doesn't want.
+          Path + branch are the only shrinkable chips (truncate kicks
+          in via min-w-0); the right cluster stays fixed-width and
+          right-aligned. The row is `relative` so the script-runner
+          can paint a thin indeterminate sweep across the bottom while
+          a build is in flight. */}
+      <div className="relative flex min-w-0 items-center gap-1.5 px-2 pt-2">
         {props.mode === "home" ? (
           <>
             <FolderPicker
@@ -442,11 +576,47 @@ export function Composer(props: Props) {
           </>
         ) : (
           <>
-            <span className="inline-flex items-center gap-1.5 rounded-md border border-dashed px-2 py-1 font-mono text-[11px] text-muted-foreground">
-              {shorten(props.cwd)}
-            </span>
+            <CwdChip cwd={props.cwd} />
             <BranchChip cwd={props.cwd} />
           </>
+        )}
+        {/* Right cluster: bg shells chip (when there are any) +
+            Scripts button. The dock chip auto-hides on 0 tasks so
+            the row stays clean when nothing is running in the
+            background. */}
+        {props.mode === "session" &&
+          props.sessionId &&
+          props.bgTasks &&
+          props.bgTasks.length > 0 &&
+          props.onStopBgTask &&
+          props.onDismissBgTask && (
+            <BackgroundDock
+              className="ms-auto shrink-0"
+              sessionId={props.sessionId}
+              tasks={props.bgTasks}
+              onStop={props.onStopBgTask}
+              onDismiss={props.onDismissBgTask}
+            />
+          )}
+        <ScriptRunner
+          cwd={props.cwd}
+          onRunningChange={setScriptRunning}
+          className={
+            props.mode === "session" &&
+            props.bgTasks &&
+            props.bgTasks.length > 0
+              ? "shrink-0"
+              : "ms-auto shrink-0"
+          }
+        />
+        {scriptRunning && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute right-0 bottom-0 left-0 h-[2px] overflow-hidden rounded-full"
+          >
+            <div className="cm-script-sweep absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-emerald-500 to-transparent" />
+            <div className="cm-script-sweep cm-script-sweep-offset absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-emerald-500 to-transparent" />
+          </div>
         )}
       </div>
 
@@ -522,17 +692,6 @@ export function Composer(props: Props) {
               e.currentTarget.value = "";
             }}
           />
-          {/* Mic is disabled (coming soon) and consumes precious row
-              space on phones where wrapping is already tight. Hide
-              below sm so the picker chips have room to breathe. */}
-          <button
-            type="button"
-            aria-label="Voice input (coming soon)"
-            disabled
-            className="hidden size-7 items-center justify-center rounded-md text-muted-foreground/50 sm:flex"
-          >
-            <Mic className="size-4" />
-          </button>
         </div>
 
         <div className="ms-auto flex flex-wrap items-center gap-1.5">
@@ -570,7 +729,7 @@ export function Composer(props: Props) {
             onPickCodexModel={props.onPickCodexModel}
           />
 
-          {props.busy && props.onInterrupt ? (
+          {props.busy && props.onInterrupt && (
             <Button
               size="icon"
               onClick={() => void props.onInterrupt?.()}
@@ -579,17 +738,18 @@ export function Composer(props: Props) {
             >
               <Square className="size-3 fill-current" />
             </Button>
-          ) : (
-            <Button
-              size="icon"
-              onClick={() => void submitText()}
-              disabled={!canSend}
-              aria-label="Send (Shift+Enter)"
-              className="ml-1 rounded-full sm:size-7"
-            >
-              <ArrowUp className="size-4" />
-            </Button>
           )}
+          <Button
+            size="icon"
+            onClick={() => void submitText()}
+            disabled={!canSend}
+            aria-label={
+              props.busy ? "Queue message (Shift+Enter)" : "Send (Shift+Enter)"
+            }
+            className="ml-1 rounded-full sm:size-7"
+          >
+            <ArrowUp className="size-4" />
+          </Button>
         </div>
       </div>
 
@@ -617,6 +777,75 @@ function shorten(p: string): string {
   const parts = compact.split("/").filter(Boolean);
   if (parts.length <= 2) return compact;
   return ".../" + parts.slice(-2).join("/");
+}
+
+// CwdChip — session-mode cwd display. Truncates to fit and reveals
+// the full path via the native title tooltip on hover; click copies
+// the absolute path to the clipboard with a short "Copied!" flash so
+// the user gets feedback without us needing a toast system.
+function CwdChip({ cwd }: { cwd: string }) {
+  const [copied, setCopied] = useState(false);
+  // Keep the timer in a ref so a rapid second click resets the
+  // window cleanly without a stale timer flipping `copied` back to
+  // false mid-flash.
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+
+  const onClick = async () => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(cwd);
+      } else if (typeof document !== "undefined") {
+        // Fallback for non-secure-context browsers where the
+        // Clipboard API is gated. Tiny offscreen textarea +
+        // execCommand("copy") is still universally supported.
+        const ta = document.createElement("textarea");
+        ta.value = cwd;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+        } finally {
+          document.body.removeChild(ta);
+        }
+      }
+      setCopied(true);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Clipboard refused (permissions / iframe sandbox). Don't
+      // flash success — leaving copied=false signals the no-op to
+      // the user via the unchanged tooltip.
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={copied ? "Copied!" : cwd}
+      aria-label={copied ? "Path copied" : `Copy path: ${cwd}`}
+      // min-w-0 lets the button shrink below its intrinsic text
+      // width so truncate can kick in; without it flex-item
+      // min-content is the full unbroken string. `shorten()` already
+      // collapses long paths to ~/.../<last 2>; this is the second
+      // line of defence on narrow viewports.
+      className={cn(
+        "min-w-0 max-w-[14rem] shrink truncate whitespace-nowrap rounded-md border border-dashed px-2 py-1 text-left align-middle font-mono text-[11px] transition-colors sm:max-w-[22rem]",
+        copied
+          ? "border-emerald-500/40 bg-emerald-500/[0.08] text-emerald-700 dark:text-emerald-300"
+          : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+      )}
+    >
+      {copied ? "Copied!" : shorten(cwd)}
+    </button>
+  );
 }
 
 // readDraft / writeDraft: tiny localStorage wrappers so the composer

@@ -5,10 +5,12 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type {
   AskUserQuestionAnswers,
   AskUserQuestionRequest,
+  BackgroundTask,
   ContextUsageBreakdown,
   HandoffRecord,
   PermissionDecision,
   PermissionRequest,
+  SessionGoal,
   SessionStatus,
   SessionUsage,
   StreamingBlock,
@@ -53,6 +55,20 @@ interface State {
   // when a fresh handoff fires. Used by chat-panel to drop boundary
   // cards at the right history indices.
   handoffs: HandoffRecord[];
+  // Active or recently-finished /goal loop. Replayed on connect via
+  // a synthetic goal_updated event so the header chip lights up
+  // without waiting for the next mutation. `null` means no goal is
+  // set; non-null carries the full state record (text + status +
+  // iteration counters) regardless of whether the loop is still
+  // running.
+  goal: SessionGoal | null;
+  // Mirror of SDK background tasks (Bash run_in_background, Agent bg,
+  // workflows). Driven by bg_task_started / bg_task_updated /
+  // bg_task_finished SSE events. Keyed by task_id. Drives the
+  // BackgroundDock — finished entries stick around with status
+  // completed/failed/killed so the user can still inspect output and
+  // dismiss them manually.
+  backgroundTasks: Record<string, BackgroundTask>;
 }
 
 type Action =
@@ -70,6 +86,15 @@ type Action =
   | { kind: "queue_edited"; msg: SDKMessage }
   | { kind: "queue_cancelled"; uuid: string }
   | { kind: "handoff"; record: HandoffRecord }
+  | { kind: "goal_updated"; goal: SessionGoal | null }
+  | { kind: "bg_task_started"; task: BackgroundTask }
+  | {
+      kind: "bg_task_updated";
+      taskId: string;
+      patch: Partial<BackgroundTask>;
+    }
+  | { kind: "bg_task_finished"; task: BackgroundTask }
+  | { kind: "bg_task_dismissed"; taskId: string }
   | { kind: "turn_interrupted" }
   | { kind: "hydrated" }
   // Wipe state back to the initial shape. Dispatched whenever the
@@ -260,6 +285,29 @@ function reducer(state: State, action: Action): State {
       if (action.msg.type === "stream_event") {
         return reduceStreamEvent(state, action.msg);
       }
+      // Defensive uuid dedupe: SSE replay + a live emit can race when
+      // a tab reconnects mid-turn, and some SDK paths echo user
+      // messages back through the Query iterator after our own
+      // sendMessage already pushed them. Either case lands the same
+      // uuid in history twice → Virtuoso "duplicate key" warning and
+      // a doubled bubble. uuid is unique per SDKMessage, so it's the
+      // right dedupe key. (Stream-event messages don't enter history
+      // — they're handled above.)
+      const incomingUuid = (action.msg as { uuid?: string }).uuid;
+      if (
+        incomingUuid &&
+        state.history.some(
+          (m) => (m as { uuid?: string }).uuid === incomingUuid,
+        )
+      ) {
+        // Assistant arrival still clears the streaming preview even
+        // when the message itself is a dup — the preview belongs to
+        // the turn that just landed, not to the prior identical msg.
+        if (action.msg.type === "assistant") {
+          return { ...state, streamingBlocks: [], streamingUsage: null };
+        }
+        return state;
+      }
       // Full assistant reply arrived — drop streaming preview so the real
       // bubble (rendered from history) takes over without overlap. Also
       // clear streamingUsage; latestUsage(history) now reads the same
@@ -319,6 +367,52 @@ function reducer(state: State, action: Action): State {
       if (exists) return state;
       return { ...state, handoffs: [...state.handoffs, action.record] };
     }
+    case "goal_updated":
+      return { ...state, goal: action.goal };
+    case "bg_task_started":
+      return {
+        ...state,
+        backgroundTasks: {
+          ...state.backgroundTasks,
+          [action.task.task_id]: action.task,
+        },
+      };
+    case "bg_task_updated": {
+      const existing = state.backgroundTasks[action.taskId];
+      if (!existing) return state;
+      return {
+        ...state,
+        backgroundTasks: {
+          ...state.backgroundTasks,
+          [action.taskId]: { ...existing, ...action.patch },
+        },
+      };
+    }
+    case "bg_task_finished": {
+      // Killed tasks vanish from the dock immediately — once you stop
+      // a shell, looking at its remains in the popover is just
+      // clutter. Completed/failed entries linger so the user can still
+      // pull up the final output and dismiss when ready.
+      if (action.task.status === "killed") {
+        if (!state.backgroundTasks[action.task.task_id]) return state;
+        const next = { ...state.backgroundTasks };
+        delete next[action.task.task_id];
+        return { ...state, backgroundTasks: next };
+      }
+      return {
+        ...state,
+        backgroundTasks: {
+          ...state.backgroundTasks,
+          [action.task.task_id]: action.task,
+        },
+      };
+    }
+    case "bg_task_dismissed": {
+      if (!state.backgroundTasks[action.taskId]) return state;
+      const next = { ...state.backgroundTasks };
+      delete next[action.taskId];
+      return { ...state, backgroundTasks: next };
+    }
     case "turn_interrupted":
       return { ...state, streamingBlocks: [], streamingUsage: null };
     case "hydrated":
@@ -347,6 +441,8 @@ const initial: State = {
   contextUsage: null,
   hydrated: false,
   handoffs: [],
+  goal: null,
+  backgroundTasks: {},
 };
 
 export interface UseChatSession extends State {
@@ -365,6 +461,16 @@ export interface UseChatSession extends State {
   // returns 409 once a message is in flight.
   editQueued: (uuid: string, text: string) => Promise<void>;
   cancelQueued: (uuid: string) => Promise<void>;
+  // BackgroundDock controls. stopBgTask routes through the SDK's
+  // query.stopTask(); dismissBgTask is local-only (clears from the
+  // dock without affecting any process — finished entries already
+  // hold no resources).
+  stopBgTask: (taskId: string) => Promise<void>;
+  dismissBgTask: (taskId: string) => void;
+  // setGoal arms a `/goal` loop with the given text, or clears it when
+  // passed null. Errors land in the chat_error stream just like the
+  // other helpers — no throw at the call site.
+  setGoal: (text: string | null) => Promise<void>;
   // Subagent grouping derived from history. byTaskId is keyed by Task
   // tool_use_id; childrenByTaskId carries the SDKMessages emitted while
   // the subagent ran; resultTaskIds names tasks whose tool_result echo
@@ -482,6 +588,24 @@ export function useChatSession(sessionId: string): UseChatSession {
     });
     es.addEventListener("turn_interrupted", () => {
       dispatch({ kind: "turn_interrupted" });
+    });
+    es.addEventListener("goal_updated", (e) => {
+      const goal = JSON.parse((e as MessageEvent).data) as SessionGoal | null;
+      dispatch({ kind: "goal_updated", goal });
+    });
+    es.addEventListener("bg_task_started", (e) => {
+      const task = JSON.parse((e as MessageEvent).data) as BackgroundTask;
+      dispatch({ kind: "bg_task_started", task });
+    });
+    es.addEventListener("bg_task_updated", (e) => {
+      const { task_id, patch } = JSON.parse(
+        (e as MessageEvent).data,
+      ) as { task_id: string; patch: Partial<BackgroundTask> };
+      dispatch({ kind: "bg_task_updated", taskId: task_id, patch });
+    });
+    es.addEventListener("bg_task_finished", (e) => {
+      const task = JSON.parse((e as MessageEvent).data) as BackgroundTask;
+      dispatch({ kind: "bg_task_finished", task });
     });
     es.addEventListener("history_replayed", () => {
       dispatch({ kind: "hydrated" });
@@ -624,6 +748,42 @@ export function useChatSession(sessionId: string): UseChatSession {
     }
   };
 
+  const stopBgTask = async (taskId: string) => {
+    const res = await fetch(
+      `/api/chat/${sessionId}/bg-tasks/${taskId}/stop`,
+      { method: "POST" },
+    );
+    if (!res.ok) {
+      const body = await res.text();
+      dispatch({ kind: "chat_error", message: `stop bg task failed: ${body}` });
+    }
+    // No optimistic dispatch — the SDK emits a task_notification with
+    // status "stopped" that the SSE listener converts into a
+    // bg_task_finished, which is the authoritative source for the
+    // killed state.
+  };
+
+  const dismissBgTask = (taskId: string) => {
+    dispatch({ kind: "bg_task_dismissed", taskId });
+  };
+
+  // /goal control — arm (text) or clear (clear:true) the persistent
+  // loop. Server pushes the directive primer on arm and the continue
+  // nudges on each result; we just kick it off.
+  const setGoal = async (text: string | null) => {
+    const body =
+      text === null ? JSON.stringify({ clear: true }) : JSON.stringify({ text });
+    const res = await fetch(`/api/chat/${sessionId}/goal`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      dispatch({ kind: "chat_error", message: `goal failed: ${detail}` });
+    }
+  };
+
   // Recompute subagent grouping when history changes. Cheap walk —
   // history is capped at 1000 messages and most chats stay under 200.
   // useMemo (not React Compiler — the input is a stable Map/Set so we
@@ -659,6 +819,9 @@ export function useChatSession(sessionId: string): UseChatSession {
     interrupt,
     editQueued,
     cancelQueued,
+    setGoal,
+    stopBgTask,
+    dismissBgTask,
     subagents: derived.list,
     subagentsByTaskId: derived.byTaskId,
     subagentChildrenByTaskId: derived.childrenByTaskId,

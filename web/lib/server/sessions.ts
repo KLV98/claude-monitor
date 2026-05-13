@@ -58,6 +58,7 @@ import type {
   AskUserQuestionEntry,
   AskUserQuestionRequest,
   Attachment,
+  BackgroundTask,
   ChatEvent,
   ContextUsageBreakdown,
   HandoffRecord,
@@ -65,6 +66,7 @@ import type {
   PermissionMode,
   PermissionRequest,
   RateLimitInfo,
+  SessionGoal,
   SessionProvider,
   SessionSnapshot,
   SessionStatus,
@@ -173,6 +175,19 @@ interface ChatSession {
   // is in flight, or codex respawn is queued). Guards re-entry: a
   // user can't fire two handoffs simultaneously.
   handoffInFlight?: boolean;
+  // Persistent `/goal` loop. While status === "active" the driver auto-
+  // pushes a "continue" user message after each `result` until the
+  // assistant emits the [GOAL_MET] sentinel or iterations hits the cap.
+  // See SessionGoal in chat-types for the full state machine.
+  goal?: SessionGoal;
+  // Live mirror of SDK background tasks (Bash run_in_background, Agent
+  // bg, etc.). Populated by the driveSession message loop from
+  // task_started / task_progress / task_updated / task_notification
+  // system messages. Tied to this session's Query — not persisted to
+  // disk: when a session is interrupted the SDK process dies and its
+  // tasks die with it, so a stale entry would be misleading. Cleared
+  // on resume.
+  backgroundTasks: Map<string, BackgroundTask>;
 }
 
 // InterruptedSession is the on-restart shadow of a ChatSession: just
@@ -202,6 +217,12 @@ interface InterruptedSession {
   // Handoffs survive a restart so a session that was already routed
   // through codex resumes through codex (not back through claude).
   handoffs?: HandoffRecord[];
+  // /goal state survives restart as a record — but a goal that was
+  // "active" when the daemon died gets restored as "cancelled" on
+  // resume below: the SDK Query is gone, the auto-continue loop is
+  // broken, and we don't want a silent restart to re-arm a runaway
+  // loop. The user can re-issue `/goal <text>` if they still want it.
+  goal?: SessionGoal;
 }
 
 // Stash the registries on globalThis so they survive Next.js dev module
@@ -269,6 +290,14 @@ async function initFromDisk(): Promise<void> {
         rateLimit: s.rate_limit,
         rateLimitObservedAt: s.rate_limit_observed_at,
         handoffs: s.handoffs,
+        // Re-arm a persisted goal in the dormant "cancelled" state
+        // (see InterruptedSession.goal note). The record stays so the
+        // chip can still show "Goal — <text> (cancelled at restart)";
+        // user re-issues `/goal <text>` to revive the loop.
+        goal:
+          s.goal && s.goal.status === "active"
+            ? { ...s.goal, status: "cancelled" }
+            : s.goal,
       });
     }
     if (stored.length > 0) {
@@ -467,6 +496,7 @@ async function persistNow(id: string): Promise<void> {
       rate_limit: s.rateLimit,
       rate_limit_observed_at: s.rateLimitObservedAt,
       handoffs: s.handoffs,
+      goal: s.goal,
     };
     await persistStoredSession(stored);
   } catch (err) {
@@ -522,6 +552,7 @@ function summarize(session: ChatSession): SessionSummary {
     handoffs: session.handoffs && session.handoffs.length > 0
       ? session.handoffs
       : undefined,
+    goal: session.goal,
   };
 }
 
@@ -568,6 +599,330 @@ function handleRateLimitEvent(
       setStatus(session, "rate_limited");
     }
   }
+}
+
+// Map an SDK task_notification status to our BackgroundTask status.
+// The SDK's "stopped" outcome covers both user-initiated stopTask()
+// calls and any other external termination — we surface that as
+// "killed" so the dock UI can render it distinctly from a clean
+// "completed" or a crashing "failed".
+function mapTaskTerminalStatus(
+  s: "completed" | "failed" | "stopped",
+): BackgroundTask["status"] {
+  return s === "stopped" ? "killed" : s;
+}
+
+// Mirror an SDK task_* system message into session.backgroundTasks.
+// We defensively upsert because task_progress / task_updated /
+// task_notification can theoretically arrive without a preceding
+// task_started (replay edge cases on resume, or a hot module reload
+// in dev that drops the in-memory map mid-flight). Returns true when
+// state actually changed so the caller can decide whether to emit.
+function handleTaskEvent(
+  session: ChatSession,
+  msg: SDKMessage & { type: "system" },
+): void {
+  if (!session.backgroundTasks) session.backgroundTasks = new Map();
+  const sub = (msg as { subtype?: string }).subtype;
+  const taskId = (msg as { task_id?: string }).task_id;
+  if (!taskId) return;
+  const existing = session.backgroundTasks.get(taskId);
+  if (sub === "task_started") {
+    const m = msg as unknown as {
+      task_id: string;
+      tool_use_id?: string;
+      description: string;
+      task_type?: string;
+      prompt?: string;
+      skip_transcript?: boolean;
+    };
+    // Skip ambient/housekeeping tasks the SDK marks as transcript-
+    // hidden — they're internal bookkeeping, not user-visible work,
+    // and showing them just clutters the dock.
+    if (m.skip_transcript) return;
+    const task: BackgroundTask = {
+      task_id: m.task_id,
+      tool_use_id: m.tool_use_id,
+      task_type: m.task_type,
+      description: m.description,
+      prompt: m.prompt,
+      status: "running",
+      started_at: new Date().toISOString(),
+    };
+    session.backgroundTasks.set(taskId, task);
+    emit(session, { type: "bg_task_started", data: task });
+    return;
+  }
+  if (sub === "task_progress") {
+    const m = msg as unknown as {
+      task_id: string;
+      description?: string;
+      summary?: string;
+      last_tool_name?: string;
+    };
+    const patch: Partial<BackgroundTask> = {};
+    if (m.description !== undefined) patch.description = m.description;
+    if (m.summary !== undefined) patch.summary = m.summary;
+    if (m.last_tool_name !== undefined) patch.last_tool_name = m.last_tool_name;
+    if (Object.keys(patch).length === 0) return;
+    const next: BackgroundTask = existing
+      ? { ...existing, ...patch }
+      : {
+          task_id: taskId,
+          description: m.description ?? "",
+          status: "running",
+          started_at: new Date().toISOString(),
+          summary: m.summary,
+          last_tool_name: m.last_tool_name,
+        };
+    session.backgroundTasks.set(taskId, next);
+    emit(session, { type: "bg_task_updated", data: { task_id: taskId, patch } });
+    return;
+  }
+  if (sub === "task_updated") {
+    const m = msg as unknown as {
+      task_id: string;
+      patch: {
+        status?: "pending" | "running" | "completed" | "failed" | "killed";
+        description?: string;
+        end_time?: number;
+        error?: string;
+        is_backgrounded?: boolean;
+      };
+    };
+    const patch: Partial<BackgroundTask> = {};
+    if (m.patch.status !== undefined) patch.status = m.patch.status;
+    if (m.patch.description !== undefined)
+      patch.description = m.patch.description;
+    if (m.patch.error !== undefined) patch.error = m.patch.error;
+    if (m.patch.is_backgrounded !== undefined)
+      patch.is_backgrounded = m.patch.is_backgrounded;
+    if (m.patch.end_time !== undefined)
+      patch.ended_at = new Date(m.patch.end_time).toISOString();
+    const next: BackgroundTask = existing
+      ? { ...existing, ...patch }
+      : {
+          task_id: taskId,
+          description: m.patch.description ?? "",
+          status: m.patch.status ?? "running",
+          started_at: new Date().toISOString(),
+          ...patch,
+        };
+    session.backgroundTasks.set(taskId, next);
+    emit(session, { type: "bg_task_updated", data: { task_id: taskId, patch } });
+    return;
+  }
+  if (sub === "task_notification") {
+    const m = msg as unknown as {
+      task_id: string;
+      tool_use_id?: string;
+      status: "completed" | "failed" | "stopped";
+      output_file: string;
+      summary: string;
+    };
+    const status = mapTaskTerminalStatus(m.status);
+    const next: BackgroundTask = {
+      ...(existing ?? {
+        task_id: taskId,
+        tool_use_id: m.tool_use_id,
+        description: m.summary,
+        started_at: new Date().toISOString(),
+      }),
+      status,
+      output_file: m.output_file,
+      summary: m.summary,
+      ended_at: new Date().toISOString(),
+    };
+    // Killed tasks are dropped from the server-side map so a page
+    // reload doesn't briefly resurrect them in the dock — the user
+    // explicitly doesn't want killed shells lingering. We still emit
+    // bg_task_finished so live clients can transition out of the
+    // running state in their own reducer (which mirrors this drop).
+    if (status === "killed") {
+      session.backgroundTasks.delete(taskId);
+    } else {
+      session.backgroundTasks.set(taskId, next);
+    }
+    emit(session, { type: "bg_task_finished", data: next });
+    return;
+  }
+}
+
+// Inspect a user SDKMessage's tool_result block (the wire shape the
+// SDK uses to send tool output back to the model) for the file path
+// the SDK uses to persist live output of a background task. The path
+// is NOT exposed as a structured field — it's embedded in the
+// model-facing English prose alongside the BashOutput shape:
+//
+//   "Command running in background with ID: <id>. Output is being
+//    written to: <path>. You will be notified when it completes…"
+//
+// We try three pairing paths to find the matching task:
+//   1. structured `tool_use_result.backgroundTaskId|agentId|task_id`
+//   2. fall back to the tool_result block's `tool_use_id` (matches
+//      `task.tool_use_id` recorded at task_started time)
+//   3. as a last resort, single-running-task assumption
+// Without this pairing the dock would only see output once the task
+// has already finished (task_notification ships output_file), which
+// defeats live monitoring.
+const BG_OUTPUT_PATH_RE =
+  /Output is being written to:\s*(\S+?)\.(?:\s|$)/;
+
+function captureBackgroundOutput(
+  session: ChatSession,
+  msg: SDKMessage & { type: "user" },
+): void {
+  if (!session.backgroundTasks || session.backgroundTasks.size === 0) return;
+  const tur = (msg as { tool_use_result?: unknown }).tool_use_result;
+  const turObj =
+    tur && typeof tur === "object" ? (tur as Record<string, unknown>) : null;
+
+  // Pull tool_result blocks once — used by all three pairing paths
+  // (text scan for the output file path, tool_use_id fallback, and
+  // the empty-result skip below).
+  const content = (msg as { message?: { content?: unknown } }).message?.content;
+  const toolResultBlocks: Array<{ tool_use_id?: string; content?: unknown }> =
+    [];
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        (block as { type?: string }).type === "tool_result"
+      ) {
+        toolResultBlocks.push(block as { tool_use_id?: string; content?: unknown });
+      }
+    }
+  }
+
+  // (1) Structured: backgroundTaskId (Bash), agentId (Agent), or a
+  // literal task_id (subsequent TaskOutput tool calls).
+  let taskId: string | null = turObj
+    ? (typeof turObj.backgroundTaskId === "string" && turObj.backgroundTaskId) ||
+      (typeof turObj.agentId === "string" && turObj.agentId) ||
+      (typeof turObj.task_id === "string" && turObj.task_id) ||
+      null
+    : null;
+
+  // (2) tool_use_id fallback: every task_started carries a
+  // `tool_use_id`; the matching tool_result block's `tool_use_id`
+  // pairs them back. Build the index lazily.
+  if (!taskId && toolResultBlocks.length > 0) {
+    const byToolUseId = new Map<string, string>();
+    for (const t of session.backgroundTasks.values()) {
+      if (t.tool_use_id) byToolUseId.set(t.tool_use_id, t.task_id);
+    }
+    for (const block of toolResultBlocks) {
+      const tuid = block.tool_use_id;
+      if (typeof tuid === "string") {
+        const tid = byToolUseId.get(tuid);
+        if (tid) {
+          taskId = tid;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!taskId) return;
+  const existing = session.backgroundTasks.get(taskId);
+  if (!existing) return;
+
+  // Output file: structured fields first (defensive — newer SDK
+  // builds might surface them), else regex the marker line out of
+  // the tool_result text content.
+  let outputFile: string | null =
+    (turObj && typeof turObj.persistedOutputPath === "string"
+      ? turObj.persistedOutputPath
+      : null) ||
+    (turObj && typeof turObj.outputFile === "string"
+      ? turObj.outputFile
+      : null) ||
+    (turObj && typeof turObj.output_file === "string"
+      ? turObj.output_file
+      : null);
+  if (!outputFile) {
+    for (const block of toolResultBlocks) {
+      const text = block.content;
+      if (typeof text === "string") {
+        const m = BG_OUTPUT_PATH_RE.exec(text);
+        if (m && m[1]) {
+          outputFile = m[1];
+          break;
+        }
+      } else if (Array.isArray(text)) {
+        // tool_result.content can also be a list of typed blocks
+        // (text/image). Concatenate any text blocks and run the
+        // regex once over the whole.
+        const joined = text
+          .map((b) =>
+            b && typeof b === "object" && (b as { type?: string }).type === "text"
+              ? String((b as { text?: unknown }).text ?? "")
+              : "",
+          )
+          .join("\n");
+        const m = BG_OUTPUT_PATH_RE.exec(joined);
+        if (m && m[1]) {
+          outputFile = m[1];
+          break;
+        }
+      }
+    }
+  }
+
+  // Inline stdout/stderr snapshot: structured fields, plus the text
+  // content of the tool_result blocks as a final fallback so the
+  // dock isn't empty for tools that bypass the structured shape.
+  let inline: string | null = null;
+  if (
+    turObj &&
+    (typeof turObj.stdout === "string" || typeof turObj.stderr === "string")
+  ) {
+    inline = `${typeof turObj.stdout === "string" ? turObj.stdout : ""}${
+      typeof turObj.stderr === "string" && turObj.stderr
+        ? `\n${turObj.stderr}`
+        : ""
+    }`;
+  }
+  if (inline === null || inline.length === 0) {
+    for (const block of toolResultBlocks) {
+      const text = block.content;
+      if (typeof text === "string" && text.trim().length > 0) {
+        inline = text;
+        break;
+      }
+      if (Array.isArray(text)) {
+        const joined = text
+          .map((b) =>
+            b && typeof b === "object" && (b as { type?: string }).type === "text"
+              ? String((b as { text?: unknown }).text ?? "")
+              : "",
+          )
+          .join("\n");
+        if (joined.trim().length > 0) {
+          inline = joined;
+          break;
+        }
+      }
+    }
+  }
+
+  const patch: Partial<BackgroundTask> = {};
+  if (outputFile && outputFile !== existing.output_file) {
+    patch.output_file = outputFile;
+  }
+  // Only overwrite the inline cache if the new snapshot actually has
+  // content — an empty stdout/stderr on the first tool_result would
+  // otherwise blow away a richer summary from earlier task_progress.
+  if (inline !== null && inline.length > 0 && inline !== existing.summary) {
+    patch.summary = inline;
+  }
+  if (Object.keys(patch).length === 0) return;
+  session.backgroundTasks.set(taskId, { ...existing, ...patch });
+  emit(session, {
+    type: "bg_task_updated",
+    data: { task_id: taskId, patch },
+  });
 }
 
 // refreshContextUsage queries the SDK control channel for an
@@ -1043,6 +1398,7 @@ function buildLiveSession(init: BuildLiveInit): ChatSession {
     rateLimit: init.rateLimit,
     rateLimitObservedAt: init.rateLimitObservedAt,
     handoffs: init.handoffs,
+    backgroundTasks: new Map(),
     query: undefined as unknown as Query, // assigned below
   };
 
@@ -1533,6 +1889,28 @@ async function driveSession(session: ChatSession): Promise<void> {
       }
       emit(session, { type: "message", data: msg });
 
+      // Mirror SDK background-task lifecycle (Bash run_in_background,
+      // Agent run_in_background, local workflows) into the session
+      // so the BackgroundDock UI can list them, tail their output,
+      // and kill them via query.stopTask() without waiting for the
+      // model to circle back. See handleTaskEvent for the full state
+      // machine.
+      if (
+        msg.type === "system" &&
+        ((msg as { subtype?: string }).subtype === "task_started" ||
+          (msg as { subtype?: string }).subtype === "task_progress" ||
+          (msg as { subtype?: string }).subtype === "task_updated" ||
+          (msg as { subtype?: string }).subtype === "task_notification")
+      ) {
+        handleTaskEvent(session, msg as SDKMessage & { type: "system" });
+      }
+      // Pair tool results back to their originating background task
+      // so the dock can show a live output file path while running.
+      // See captureBackgroundOutput for the field-probe details.
+      if (msg.type === "user") {
+        captureBackgroundOutput(session, msg as SDKMessage & { type: "user" });
+      }
+
       // Snapshot per-API-call usage from each top-level assistant
       // message. Subagent (Task) assistant messages have a non-null
       // parent_tool_use_id and run inside their own context window, so
@@ -1560,6 +1938,12 @@ async function driveSession(session: ChatSession): Promise<void> {
       if (msg.type === "result") {
         setStatus(session, "idle");
         void refreshContextUsage(session);
+        // /goal auto-continue: if the user set a persistent goal and
+        // the assistant didn't emit the [GOAL_MET] sentinel, push the
+        // next "continue" user message so the SDK keeps working. Runs
+        // here (post-status-flip, pre-rate-limit) so the loop fires
+        // even on tool-light turns where no rate_limit_event happens.
+        advanceGoalLoop(session);
       } else if (msg.type === "rate_limit_event") {
         // SDK auto-retries internally up to CLAUDE_CODE_MAX_RETRIES;
         // we observe so the UI can render a countdown. We DON'T
@@ -1637,6 +2021,7 @@ function summarizeInterrupted(s: InterruptedSession): SessionSummary {
     rate_limit: s.rateLimit,
     rate_limit_observed_at: s.rateLimitObservedAt,
     handoffs: s.handoffs && s.handoffs.length > 0 ? s.handoffs : undefined,
+    goal: s.goal,
   };
 }
 
@@ -1661,12 +2046,16 @@ export function listSessions(): SessionSummary[] {
 export function snapshotSession(id: string): SessionSnapshot | undefined {
   const s = sessions.get(id);
   if (s) {
+    const bg = s.backgroundTasks
+      ? Array.from(s.backgroundTasks.values())
+      : undefined;
     return {
       summary: summarize(s),
       history: s.history,
       pending_permission: s.pendingPermission?.request,
       pending_question: s.pendingQuestion?.request,
       latest_plan: s.latestPlan,
+      background_tasks: bg && bg.length > 0 ? bg : undefined,
     };
   }
   // Interrupted: serve metadata + history from disk so the chat panel
@@ -1711,6 +2100,151 @@ export function emitPlanEvent(
   const s = getOrResume(sessionId);
   if (!s) throw new Error("session not found");
   emit(s, { type, data: plan });
+}
+
+// Default safety cap for /goal auto-continue. Sized empirically: a
+// well-scoped goal usually wraps in 3–6 turns; 12 lets a moderately
+// complex one finish without burning a 5-hour window on a runaway.
+// Hit the cap → status flips to "exhausted" and the loop stops.
+const GOAL_MAX_ITERATIONS = 12;
+
+// The literal sentinel the model must emit (as part of its assistant
+// text) to mark the goal as accomplished. Matched case-insensitive,
+// flexible on the separator so [GOAL MET] / [goal-met] / [GoalMet]
+// all work — the model isn't perfectly literal.
+const GOAL_MET_PATTERN = /\[\s*goal[\s_-]?met\s*\]/i;
+
+// Sentinel injected when /goal is first set. Prefixes the user's goal
+// text and frames the loop contract for the model: keep working, end
+// with [GOAL_MET]. We send it via sendMessage so it appears as a
+// regular user message in history — that way the chat surface is
+// honest about what's driving subsequent turns.
+function buildGoalPrimer(text: string, maxIterations: number): string {
+  return [
+    `## /goal directive`,
+    ``,
+    `You have just been given a persistent goal. Work on it autonomously across multiple turns; do not stop and ask for permission between turns. Use your tools, plan, and iterate.`,
+    ``,
+    `**Goal:** ${text}`,
+    ``,
+    `When the goal is complete, end that turn's reply with the literal sentinel \`[GOAL_MET]\` on its own line. The orchestrator watches for it and will stop the auto-continue loop. If you genuinely cannot make progress (missing access, ambiguous requirement, hard error you can't resolve) say so plainly — the user will intervene.`,
+    ``,
+    `Safety cap: the loop will auto-stop after ${maxIterations} continues if no \`[GOAL_MET]\` is emitted. Pace yourself — don't burn turns on filler updates.`,
+    ``,
+    `Begin now.`,
+  ].join("\n");
+}
+
+// Continue prompt pushed after each result while the goal is still
+// active. Kept terse so it doesn't dilute the goal directive that's
+// still anchoring the conversation upstream.
+function buildGoalContinue(text: string, iteration: number): string {
+  return `continue toward goal (${iteration}/${GOAL_MAX_ITERATIONS}): ${text}`;
+}
+
+function lastTopLevelAssistantText(history: SDKMessage[]): string {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.type !== "assistant") continue;
+    const parent = (m as { parent_tool_use_id?: string | null })
+      .parent_tool_use_id;
+    if (parent) continue;
+    const content = m.message?.content;
+    if (!Array.isArray(content)) return "";
+    const parts: string[] = [];
+    for (const b of content) {
+      if ((b as { type?: string }).type === "text") {
+        const t = (b as { text?: string }).text;
+        if (typeof t === "string") parts.push(t);
+      }
+    }
+    return parts.join("\n");
+  }
+  return "";
+}
+
+function emitGoalUpdated(session: ChatSession): void {
+  emit(session, { type: "goal_updated", data: session.goal ?? null });
+  schedulePersist(session.id);
+}
+
+// advanceGoalLoop runs on every `result` message. Skips silently when
+// no goal is active. When active:
+//   - if the last assistant text contains the [GOAL_MET] sentinel,
+//     flip to "met" and stop the loop;
+//   - if we've hit the iteration cap, flip to "exhausted" and stop;
+//   - else bump the counter and push a continue user message so the
+//     SDK iterator picks up the next turn.
+function advanceGoalLoop(session: ChatSession): void {
+  const goal = session.goal;
+  if (!goal || goal.status !== "active") return;
+  const lastText = lastTopLevelAssistantText(session.history);
+  if (GOAL_MET_PATTERN.test(lastText)) {
+    session.goal = { ...goal, status: "met" };
+    emitGoalUpdated(session);
+    return;
+  }
+  const next = goal.iterations + 1;
+  if (next > goal.max_iterations) {
+    session.goal = { ...goal, status: "exhausted" };
+    emitGoalUpdated(session);
+    return;
+  }
+  session.goal = { ...goal, iterations: next };
+  emitGoalUpdated(session);
+  try {
+    sendMessage(session.id, buildGoalContinue(goal.text, next));
+  } catch (err) {
+    // Failing to push the continue (session went away, closed) just
+    // ends the loop quietly — the goal record stays so the UI can
+    // show the partial progress.
+    console.warn(`[sessions] goal continue push failed for ${session.id}:`, err);
+  }
+}
+
+// setSessionGoal is the public entry for /goal. Pass a non-empty text
+// to (re)arm the loop and prime it with a directive prompt; pass null
+// to cancel an active loop (the record flips to "cancelled" so the UI
+// chip can render the final state). Returns the resulting goal record
+// (or null when cleared) so the route can echo it back to the client.
+export function setSessionGoal(
+  sessionId: string,
+  text: string | null,
+): SessionGoal | null {
+  const s = getOrResume(sessionId);
+  if (!s) throw new Error("session not found");
+  if (text === null || text.trim() === "") {
+    // Clear: drop the record entirely (chip disappears). The
+    // auto-continue loop is gated on goal?.status === "active", so
+    // setting goal to undefined here also stops the next push.
+    s.goal = undefined;
+    emitGoalUpdated(s);
+    return null;
+  }
+  const trimmed = text.trim();
+  s.goal = {
+    text: trimmed,
+    set_at: new Date().toISOString(),
+    iterations: 0,
+    max_iterations: GOAL_MAX_ITERATIONS,
+    status: "active",
+  };
+  emitGoalUpdated(s);
+  // Prime the loop with the directive as a real user message so the
+  // SDK starts working on it. Subsequent continues are pushed by
+  // advanceGoalLoop after each result.
+  try {
+    sendMessage(sessionId, buildGoalPrimer(trimmed, GOAL_MAX_ITERATIONS));
+  } catch (err) {
+    // If the primer push fails (session closed, queue full, ...),
+    // demote the record to "cancelled" so the UI doesn't claim we're
+    // looping when nothing actually queued. Don't throw — the route
+    // already validated the session exists; this is best-effort.
+    s.goal = { ...s.goal, status: "cancelled" };
+    emitGoalUpdated(s);
+    console.warn(`[sessions] goal primer push failed for ${sessionId}:`, err);
+  }
+  return s.goal;
 }
 
 const REQUEST_DEDUPE_TTL_MS = 30_000;
@@ -2587,9 +3121,56 @@ export function interruptTurn(
   ) {
     return { ok: false, reason: "not_running" };
   }
+  // Interrupt also kills any in-flight /goal auto-continue loop. The
+  // user explicitly hit stop; auto-pushing another "continue" message
+  // after respawn would be insulting. Record stays so the chip can
+  // show "cancelled" until the user clears it or starts a fresh goal.
+  if (s.goal && s.goal.status === "active") {
+    s.goal = { ...s.goal, status: "cancelled" };
+    emitGoalUpdated(s);
+  }
   emit(s, { type: "turn_interrupted", data: {} });
   respawnQuery(s);
   return { ok: true };
+}
+
+// Stop a background task via the SDK's control channel. The SDK will
+// emit a task_notification with status "stopped" that our message
+// loop hook (handleTaskEvent) translates into a bg_task_finished SSE
+// event — the dock card flips to "killed" automatically, no extra
+// state plumbing needed here.
+export async function stopBackgroundTask(
+  sessionId: string,
+  taskId: string,
+): Promise<{ ok: boolean; reason?: "session_missing" | "unsupported" | "error"; error?: string }> {
+  const s = sessions.get(sessionId);
+  if (!s) return { ok: false, reason: "session_missing" };
+  const q = s.query as unknown as {
+    stopTask?: (taskId: string) => Promise<void>;
+  };
+  if (typeof q.stopTask !== "function") {
+    return { ok: false, reason: "unsupported" };
+  }
+  try {
+    await q.stopTask(taskId);
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: "error",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+// Get the current snapshot of a background task. Lookup-only — does
+// not touch the SDK. Used by the output-tail endpoint to resolve the
+// task's on-disk output_file before reading it.
+export function getBackgroundTask(
+  sessionId: string,
+  taskId: string,
+): BackgroundTask | undefined {
+  return sessions.get(sessionId)?.backgroundTasks?.get(taskId);
 }
 
 export async function stopSession(sessionId: string): Promise<void> {

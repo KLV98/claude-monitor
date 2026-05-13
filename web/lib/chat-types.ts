@@ -157,6 +157,36 @@ export interface SessionSummary {
   // codex (different account) or reverse handoffs later without a
   // schema bump.
   handoffs?: HandoffRecord[];
+  // Persistent `/goal` loop state. Omitted when no goal is set. Even
+  // after the loop ends (met / exhausted / cancelled) we keep the
+  // record around so the header chip can render the final outcome
+  // until the user explicitly clears it or starts a fresh chat.
+  goal?: SessionGoal;
+}
+
+// SessionGoal is the persistent loop condition set via `/goal <text>`.
+// Mirrors Claude Code CLI's goal feature: a directive the model keeps
+// working toward across multiple turns until it emits the literal
+// [GOAL_MET] sentinel in a reply, at which point the loop ends. The
+// orchestrator handles the loop server-side by auto-pushing a
+// "continue" user message after each `result` while status === "active".
+//
+// iterations counts how many auto-continues have fired (the first turn
+// — when the user set the goal — is iteration 0). max_iterations is a
+// safety cap so a model that never volunteers [GOAL_MET] doesn't burn
+// budget forever. Once hit we flip status to "exhausted" and stop.
+export interface SessionGoal {
+  text: string;
+  // ISO-8601 wall-clock the goal was set. Used by the header chip to
+  // render an age ("set 2m ago").
+  set_at: string;
+  iterations: number;
+  max_iterations: number;
+  // active: the loop is running, will auto-continue at next result.
+  // met: model emitted [GOAL_MET]; loop is done.
+  // exhausted: hit max_iterations without [GOAL_MET]; loop is done.
+  // cancelled: user ran `/goal clear` (or interrupted the session).
+  status: "active" | "met" | "exhausted" | "cancelled";
 }
 
 // SubagentSummary describes one Task tool_use spawn. The Task tool's
@@ -292,11 +322,51 @@ export interface AskUserQuestionRequest {
 // the user skipped that question.
 export type AskUserQuestionAnswers = Record<string, string>;
 
+// Background task mirror for the BackgroundDock. We don't own the
+// processes — Claude's SDK does. We listen to its task_* system
+// messages (task_started/task_progress/task_updated/task_notification)
+// and surface a compact view of them so the user can see + kill
+// runaways without waiting for the model to circle back. Kill goes
+// through query.stopTask(taskId); output_file is a path on disk the
+// SDK writes the task's transcript/stdout to.
+export type BackgroundTaskStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "killed";
+
+export interface BackgroundTask {
+  task_id: string;
+  tool_use_id?: string;
+  task_type?: string;
+  description: string;
+  // For Bash tasks this is the command; for subagents it's the prompt.
+  prompt?: string;
+  status: BackgroundTaskStatus;
+  started_at: string;
+  ended_at?: string;
+  error?: string;
+  // Disk path the SDK writes the running transcript to. Read it via
+  // /api/chat/[id]/bg-tasks/[taskId]/output for a live tail.
+  output_file?: string;
+  summary?: string;
+  // True once the SDK auto-backgrounds an originally foreground bash.
+  is_backgrounded?: boolean;
+  last_tool_name?: string;
+}
+
 // ChatEvent is the discriminated union streamed over SSE on
 // /api/chat/[id]/events.
 export type ChatEvent =
   | { type: "message"; data: SDKMessage }
   | { type: "status"; data: { status: SessionStatus } }
+  | { type: "bg_task_started"; data: BackgroundTask }
+  | {
+      type: "bg_task_updated";
+      data: { task_id: string; patch: Partial<BackgroundTask> };
+    }
+  | { type: "bg_task_finished"; data: BackgroundTask }
   | { type: "permission_request"; data: PermissionRequest }
   | { type: "permission_resolved"; data: { id: string } }
   | { type: "ask_user_question"; data: AskUserQuestionRequest }
@@ -322,6 +392,11 @@ export type ChatEvent =
   // a "→ codex" divider between the last Claude assistant turn and
   // the first codex turn.
   | { type: "handoff"; data: HandoffRecord }
+  // Fired whenever the session's /goal state changes: a new goal is
+  // set, an iteration ticks, the model emits [GOAL_MET], the safety
+  // cap fires, or the user clears it. data === null means no goal is
+  // currently set (post-clear).
+  | { type: "goal_updated"; data: SessionGoal | null }
   // Sentinel emitted by the SSE route AFTER it finishes replaying
   // history. The client uses this to know when items.length is final
   // (no more historical messages will arrive in this burst), so the
@@ -341,6 +416,10 @@ export interface SessionSnapshot {
   pending_permission?: PermissionRequest;
   pending_question?: AskUserQuestionRequest;
   latest_plan?: PlanRecord;
+  // Snapshot of all background tasks the SDK is currently tracking
+  // (running + recently-finished within the SDK's retention window).
+  // Replayed on reconnect so the BackgroundDock survives a refresh.
+  background_tasks?: BackgroundTask[];
 }
 
 export type SubagentNavTarget = {
