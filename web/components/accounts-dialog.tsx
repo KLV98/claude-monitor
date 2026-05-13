@@ -3,7 +3,12 @@
 import { useCallback, useEffect, useState, useTransition } from "react";
 import {
   AlertCircle,
+  Check,
   ChevronDown,
+  Copy,
+  Eye,
+  EyeOff,
+  KeyRound,
   Loader2,
   Plus,
   RefreshCw,
@@ -13,10 +18,12 @@ import {
 import { useDaemonContext } from "@/lib/daemon-context";
 import {
   addAccount,
+  fetchAccountCredentials,
   fetchSwapConfig,
   reloginAccount,
   swapTo,
   updateSwapConfig,
+  type AccountCredentials,
   type AccountState,
   type SwapConfig,
   type Window,
@@ -217,6 +224,12 @@ function AccountCard({
   onSwap: () => void;
   onRelogin: () => void;
 }) {
+  const [tokenOpen, setTokenOpen] = useState(false);
+  // Anthropic-only: Codex tokens live in plaintext auth.json and the
+  // daemon endpoint refuses them. Hide the button on Codex rows so the
+  // user doesn't click into a guaranteed 400.
+  const supportsTokenView =
+    !account.provider || account.provider === "anthropic";
   return (
     <div
       className={`rounded-lg border p-3 transition-colors ${
@@ -242,6 +255,17 @@ function AccountCard({
             full card width, where they share space without crowding
             the email out of the picture. */}
         <div className="flex w-full shrink-0 justify-end gap-1 sm:w-auto">
+          {supportsTokenView && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => setTokenOpen(true)}
+              title="View OAuth keychain envelope (accessToken/refreshToken/expiresAt)"
+            >
+              <KeyRound className="size-3.5" aria-hidden />
+              <span className="sr-only sm:not-sr-only sm:ml-1">Token</span>
+            </Button>
+          )}
           <Button
             size="sm"
             variant="ghost"
@@ -263,6 +287,14 @@ function AccountCard({
           )}
         </div>
       </div>
+      {supportsTokenView && (
+        <TokenDialog
+          open={tokenOpen}
+          onOpenChange={setTokenOpen}
+          ident={account.name}
+          accountLabel={account.name}
+        />
+      )}
       {/* Long error strings ("refresh rate limited (retry in 2m29s)")
           get their own row so they don't wrap mid-card and push the
           action buttons into a weird offset. */}
@@ -281,6 +313,279 @@ function AccountCard({
       </div>
     </div>
   );
+}
+
+// TokenDialog fetches the OS-keychain envelope for one account and
+// renders accessToken/refreshToken (masked by default, Reveal toggles)
+// plus expiresAt as both raw ms and a humanized countdown. Lazy fetch:
+// the GET only fires when the dialog opens, so just listing accounts
+// never reads secrets from the keychain (which would trigger a
+// biometric/keyring prompt on some hosts).
+function TokenDialog({
+  open,
+  onOpenChange,
+  ident,
+  accountLabel,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  ident: string;
+  accountLabel: string;
+}) {
+  const [creds, setCreds] = useState<AccountCredentials | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [revealAccess, setRevealAccess] = useState(false);
+  const [revealRefresh, setRevealRefresh] = useState(false);
+  const now = useNowTick(open ? 1000 : null);
+
+  // Refetch each open so we don't show a stale token after a refresh
+  // tick rotated it. Reset reveal state too — re-opening should
+  // start masked even if the user revealed last time.
+  useEffect(() => {
+    if (!open) {
+      setCreds(null);
+      setError(null);
+      setRevealAccess(false);
+      setRevealRefresh(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    fetchAccountCredentials(ident)
+      .then((c) => {
+        if (!cancelled) setCreds(c);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, ident]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg gap-3 p-4">
+        <DialogHeader>
+          <DialogTitle className="pr-8 text-base">
+            Keychain envelope · {accountLabel}
+          </DialogTitle>
+          <DialogDescription className="pr-8 text-xs">
+            OAuth credentials read from the OS credential store. Tokens
+            are masked — reveal only when you trust the surrounding
+            screen.
+          </DialogDescription>
+        </DialogHeader>
+        {loading && (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Loader2 className="size-3 animate-spin" /> Loading…
+          </div>
+        )}
+        {error && (
+          <Alert variant="destructive">
+            <AlertTitle>Failed to load credentials</AlertTitle>
+            <AlertDescription className="break-all">{error}</AlertDescription>
+          </Alert>
+        )}
+        {creds && (
+          <div className="space-y-3">
+            <TokenField
+              label="accessToken"
+              value={creds.accessToken}
+              revealed={revealAccess}
+              onToggleReveal={() => setRevealAccess((v) => !v)}
+            />
+            <TokenField
+              label="refreshToken"
+              value={creds.refreshToken}
+              revealed={revealRefresh}
+              onToggleReveal={() => setRevealRefresh((v) => !v)}
+            />
+            <ExpiresAtField creds={creds} now={now} />
+            <div className="pt-1 text-[10px] text-muted-foreground">
+              {creds.config_dir}
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function TokenField({
+  label,
+  value,
+  revealed,
+  onToggleReveal,
+}: {
+  label: string;
+  value: string;
+  revealed: boolean;
+  onToggleReveal: () => void;
+}) {
+  const displayed = revealed ? value : maskToken(value);
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between">
+        <label className="text-[11px] font-medium tracking-wider text-muted-foreground uppercase">
+          {label}
+        </label>
+        <div className="flex items-center gap-1">
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-[11px]"
+            onClick={onToggleReveal}
+            title={revealed ? "Hide" : "Reveal full token"}
+          >
+            {revealed ? (
+              <>
+                <EyeOff className="size-3" aria-hidden />
+                <span className="ml-1">Hide</span>
+              </>
+            ) : (
+              <>
+                <Eye className="size-3" aria-hidden />
+                <span className="ml-1">Reveal</span>
+              </>
+            )}
+          </Button>
+          <CopyButton value={value} />
+        </div>
+      </div>
+      {/* break-all so a 200-char JWT wraps inside the card instead of
+          stretching the dialog past viewport width. */}
+      <div className="rounded-md border bg-muted/40 px-2 py-1.5 font-mono text-[11px] break-all">
+        {displayed || (
+          <span className="italic text-muted-foreground">(empty)</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ExpiresAtField({
+  creds,
+  now,
+}: {
+  creds: AccountCredentials;
+  now: number;
+}) {
+  const ms = creds.expiresAt;
+  if (!ms) {
+    return (
+      <div className="space-y-1">
+        <label className="text-[11px] font-medium tracking-wider text-muted-foreground uppercase">
+          expiresAt
+        </label>
+        <div className="rounded-md border bg-muted/40 px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+          0 · not recorded
+        </div>
+      </div>
+    );
+  }
+  const delta = ms - now;
+  const expired = delta <= 0;
+  const countdown = humanizeDelta(Math.abs(delta));
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between">
+        <label className="text-[11px] font-medium tracking-wider text-muted-foreground uppercase">
+          expiresAt
+        </label>
+        <CopyButton value={String(ms)} />
+      </div>
+      <div className="rounded-md border bg-muted/40 px-2 py-1.5 font-mono text-[11px]">
+        <div>{ms}</div>
+        <div className="text-[10px] text-muted-foreground">
+          {creds.expiresAtIso}
+          {" · "}
+          <span className={expired ? "text-destructive" : ""}>
+            {expired ? `expired ${countdown} ago` : `in ${countdown}`}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Older browsers / non-https origins: fall back to a textarea
+      // selection so the user can still grab the value.
+      const ta = document.createElement("textarea");
+      ta.value = value;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      } finally {
+        document.body.removeChild(ta);
+      }
+    }
+  };
+  return (
+    <Button
+      size="sm"
+      variant="ghost"
+      className="h-7 px-2 text-[11px]"
+      onClick={() => void copy()}
+      disabled={!value}
+      title="Copy value to clipboard"
+    >
+      {copied ? (
+        <>
+          <Check className="size-3" aria-hidden />
+          <span className="ml-1">Copied</span>
+        </>
+      ) : (
+        <>
+          <Copy className="size-3" aria-hidden />
+          <span className="ml-1">Copy</span>
+        </>
+      )}
+    </Button>
+  );
+}
+
+// maskToken renders a token as "<first6>…<last4>" so the user can
+// still distinguish two tokens at a glance without leaking the bulk
+// of the secret. Short tokens (< 12 chars) collapse to bullets to
+// avoid showing most of the value.
+function maskToken(v: string): string {
+  if (!v) return "";
+  if (v.length < 12) return "•".repeat(v.length);
+  return `${v.slice(0, 6)}…${v.slice(-4)}`;
+}
+
+// humanizeDelta formats a positive ms duration as "1h 23m" / "2d 4h"
+// / "45s". Shared between expiresAt countdown and the "expired N ago"
+// branch via Math.abs upstream.
+function humanizeDelta(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  if (days >= 1) return `${days}d ${hours}h`;
+  if (hours >= 1) return `${hours}h ${minutes.toString().padStart(2, "0")}m`;
+  if (minutes >= 1) return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+  return `${seconds}s`;
 }
 
 function AddAccountForm({

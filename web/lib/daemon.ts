@@ -149,6 +149,34 @@ export async function addAccount(
   return jsonOrThrow(res);
 }
 
+// AccountCredentials mirrors server.CredentialsView. Anthropic-only —
+// returns the keychain envelope written by `claude auth login`. The
+// daemon refuses Codex rows because they store tokens in plaintext
+// auth.json, not the OS credential store. Treat the response as
+// sensitive: a leaked refreshToken lets an attacker mint new access
+// tokens until the user manually revokes the OAuth grant.
+export interface AccountCredentials {
+  provider: AccountProvider;
+  config_dir: string;
+  accessToken: string;
+  refreshToken: string;
+  /** Unix milliseconds, exactly the value persisted in the keychain envelope. */
+  expiresAt: number;
+  /** RFC3339 mirror of expiresAt for human display; omitted when expiresAt is 0. */
+  expiresAtIso?: string;
+}
+
+export async function fetchAccountCredentials(
+  ident: string,
+  signal?: AbortSignal,
+): Promise<AccountCredentials> {
+  const res = await fetch(
+    `${DAEMON_URL}/api/account/credentials?ident=${encodeURIComponent(ident)}`,
+    { signal },
+  );
+  return jsonOrThrow(res);
+}
+
 // SwapConfig mirrors server.SwapConfigView in Go. Wraps the writable
 // auto-swap knobs the TUI's editor exposes — the web UI hits
 // /api/swap-config so users don't need to drop into the terminal.

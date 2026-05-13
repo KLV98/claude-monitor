@@ -151,6 +151,11 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/swap-config", s.handleSwapConfigUpdate)
 	mux.HandleFunc("POST /api/account/login", s.handleAccountLogin)
 	mux.HandleFunc("POST /api/account/add", s.handleAccountAdd)
+	// GET /api/account/credentials — returns the OS-keychain envelope
+	// (accessToken/refreshToken/expiresAt) for an Anthropic account.
+	// Exposes secrets; daemon threat model already trusts API reachers,
+	// but callers should still treat the response as sensitive.
+	mux.HandleFunc("GET /api/account/credentials", s.handleAccountCredentials)
 	// GET /api/account/mcp-servers — proxies claude.ai's MCP integration
 	// list using the account's keychain-stored OAuth token. The token
 	// stays inside the daemon; only the parsed server names/URLs cross
