@@ -22,7 +22,7 @@ ifeq ($(GOOS),darwin)
 LDFLAGS += -linkmode=external
 endif
 
-.PHONY: all build build-go build-web build-mcp menubar menubar-run menubar-install run once install clean fmt vet tidy release help
+.PHONY: all build build-go build-web build-mcp menubar menubar-run menubar-install run dev once install clean fmt vet tidy release help
 
 all: build
 
@@ -107,6 +107,10 @@ menubar-install: menubar
 ## run: build everything and start claude-monitor (daemon + web)
 run: build
 	$(BIN_DIR)/$(BINARY)
+
+## dev: run a dev instance on alternate ports (8799/3738) alongside the menu-bar app
+dev: build-go
+	@scripts/dev.sh
 
 ## install: copy binary AND web build to $(INSTALL_DIR) (default: ~/bin)
 install: build
